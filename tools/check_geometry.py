@@ -80,7 +80,8 @@ def compare(orig_path, merged_path):
     same_geometry = (ko == km and sorted(go) == sorted(gm)
                      and all(np.array_equal(go[m], gm[m]) for m in go)
                      and all(np.allclose(w, pm[0][0], atol=1e-9) for w, _ in po + pm)
-                     and all(jo.get(k) == jm.get(k) for k in ('materials', 'textures', 'samplers'))
+                     and all(jo.get(k) == jm.get(k) for k in ('materials', 'textures', 'samplers',
+                                                              'extensionsUsed', 'extensionsRequired'))
                      and image_hashes(jo, bo) == image_hashes(jm, bm))
     same_order = same_geometry and np.array_equal(np.concatenate([r for _, r in ro]), np.concatenate([r for _, r in rm]))
     return {'scene': os.path.basename(merged_path), 'primitives_before': len(po), 'primitives_after': len(pm),

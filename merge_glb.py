@@ -8,8 +8,18 @@ of them. This script concatenates the vertex and index buffers of each
 material into one primitive. Vertex values, triangles, materials and texture
 bytes are copied unchanged.
 
+Two optional behaviours, both needed for HM3D v0.2:
+  * glTF extensions: files may declare KHR_materials_unlit (187 of the 800 HM3D v0.2 train scenes do). It only
+    appears on materials, which are copied unchanged, so it is accepted and the top-level extensionsUsed /
+    extensionsRequired are copied to the output. GOOGLE_texture_basis on textures is accepted as before. Any other
+    extension still raises an error, because it could be dropped silently.
+  * --adjacent: merge only runs of consecutive primitives that share a material. The draw order stays the same,
+    which keeps every pixel identical in scenes whose primitives interleave materials (in HM3D v0.2, 50 scenes
+    re-exported by Blender). Without it, all primitives of a material are merged into one.
+
 Usage:
     python merge_glb.py in.glb out.glb
+    python merge_glb.py --adjacent in.glb out.glb
     python merge_glb.py --scenes-dir data/scene_datasets/mp3d          # in place, keeps <name>.orig
     python merge_glb.py --scenes-dir data/scene_datasets/mp3d --restore
 """
@@ -88,12 +98,24 @@ def node_world_transforms(js):
     return out
 
 
-def merge(src, dst, verbose=True):
+def merge(src, dst, verbose=True, adjacent=False):
     js, bin_ = read_glb(src)
     # Anything this script would otherwise drop or mis-handle is rejected up front.
     assert not js.get('animations') and not js.get('skins'), 'animations/skins are not supported'
-    assert not js.get('extensionsUsed') and not js.get('extensionsRequired'), \
+    # KHR_materials_unlit only appears on materials, which are copied unchanged, so the extension is kept.
+    allowed = {'KHR_materials_unlit'}
+    assert set(js.get('extensionsUsed', [])) <= allowed and set(js.get('extensionsRequired', [])) <= allowed, \
         'glTF extensions are not supported: %s' % js.get('extensionsUsed')
+    assert 'extensions' not in js, 'top-level glTF extensions are not supported'
+    for k in ('nodes', 'meshes', 'accessors', 'bufferViews', 'buffers', 'images', 'samplers', 'scenes'):
+        assert not any('extensions' in o for o in js.get(k, [])), 'extensions on %s are not supported' % k
+    # Textures are copied unchanged and images keep their order, so the image index in GOOGLE_texture_basis stays valid.
+    assert all(set((t.get('extensions') or {}).keys()) <= {'GOOGLE_texture_basis'} for t in js.get('textures', [])), \
+        'texture extensions other than GOOGLE_texture_basis are not supported'
+    assert not any('extensions' in p for m in js.get('meshes', []) for p in m['primitives']), \
+        'extensions on primitives are not supported'
+    assert all(set((m.get('extensions') or {}).keys()) <= allowed for m in js.get('materials', [])), \
+        'material extensions other than KHR_materials_unlit are not supported'
     assert all('bufferView' in im for im in js.get('images', [])), 'external image URIs are not supported'
 
     # All mesh nodes must share one world transform; it is kept on the single output node.
@@ -114,13 +136,22 @@ def merge(src, dst, verbose=True):
         assert sorted(p['attributes'].keys()) == attr_keys, 'primitives have different attribute sets'
         assert 'indices' in p and 'material' in p, 'every primitive needs indices and a material'
 
-    groups = {}
-    for p in prims:
-        groups.setdefault(p['material'], []).append(p)
+    if adjacent:   # only merge consecutive primitives with the same material; output keeps the original order
+        runs = []
+        for p in prims:
+            if runs and runs[-1][1] == p['material']:
+                runs[-1][2].append(p)
+            else:
+                runs.append((len(runs), p['material'], [p]))
+    else:
+        groups = {}
+        for p in prims:
+            groups.setdefault(p['material'], []).append(p)
+        runs = [(mat, mat, ps) for mat, ps in sorted(groups.items())]
 
-    merged = {}  # material -> {attribute: array, 'indices': array}
+    merged = {}  # key (material, or run index with adjacent=True) -> {attribute: array, 'indices': array}
     tri_before = 0
-    for mat, ps in sorted(groups.items()):
+    for key, mat, ps in runs:
         arrs = {k: [] for k in attr_keys}
         idxs = []
         vbase = 0
@@ -137,8 +168,8 @@ def merge(src, dst, verbose=True):
             tri_before += len(ind) // 3
         for k in attr_keys:
             assert len(set(a.dtype for a in arrs[k])) == 1, 'attribute %s has mixed component types' % k
-        merged[mat] = {k: np.concatenate(arrs[k]) for k in attr_keys}
-        merged[mat]['indices'] = np.concatenate(idxs)
+        merged[key] = {k: np.concatenate(arrs[k]) for k in attr_keys}
+        merged[key]['indices'] = np.concatenate(idxs)
 
     # New binary chunk: images first (bytes unchanged), then geometry.
     new_bvs, new_bin = [], []
@@ -172,8 +203,8 @@ def merge(src, dst, verbose=True):
         return len(new_accs) - 1
 
     tri_after = 0
-    for mat in sorted(merged):
-        g = merged[mat]
+    for key, mat, _ in runs:
+        g = merged[key]
         attrs = {}
         for k in attr_keys:
             a = g[k]
@@ -205,6 +236,9 @@ def merge(src, dst, verbose=True):
     out['bufferViews'] = new_bvs
     bin_all = b''.join(new_bin)
     out['buffers'] = [{'byteLength': len(bin_all)}]
+    for k in ('extensionsUsed', 'extensionsRequired'):   # keep the top-level extension declarations
+        if k in js:
+            out[k] = js[k]
 
     jb = json.dumps(out, separators=(',', ':')).encode()
     jb += b' ' * ((-len(jb)) % 4)
@@ -229,14 +263,14 @@ def scene_files(root, pattern):
     return sorted(f for f in files if not f.endswith('.orig'))
 
 
-def merge_dir(root, pattern):
+def merge_dir(root, pattern, adjacent=False):
     total_before = total_after = 0
     for path in scene_files(root, pattern):
         orig = path + '.orig'
         if not os.path.exists(orig):
             os.rename(path, orig)
         tmp = path + '.tmp'
-        before, after = merge(orig, tmp)
+        before, after = merge(orig, tmp, adjacent=adjacent)
         os.replace(tmp, path)
         total_before += before; total_after += after
     print('total: %d -> %d primitives' % (total_before, total_after))
@@ -257,11 +291,15 @@ def main():
     ap.add_argument('--scenes-dir', help='process every scene under this directory in place')
     ap.add_argument('--pattern', default='*/*.glb', help='glob under --scenes-dir (default: */*.glb)')
     ap.add_argument('--restore', action='store_true', help='move <name>.orig back over <name>')
+    ap.add_argument('--adjacent', action='store_true',
+                    help='merge only consecutive primitives that share a material (keeps the draw order)')
     args = ap.parse_args()
-    if args.scenes_dir:
-        (restore_dir if args.restore else merge_dir)(args.scenes_dir, args.pattern)
+    if args.scenes_dir and args.restore:
+        restore_dir(args.scenes_dir, args.pattern)
+    elif args.scenes_dir:
+        merge_dir(args.scenes_dir, args.pattern, adjacent=args.adjacent)
     elif args.src and args.dst:
-        merge(args.src, args.dst)
+        merge(args.src, args.dst, adjacent=args.adjacent)
     else:
         ap.error('give src and dst, or --scenes-dir')
 

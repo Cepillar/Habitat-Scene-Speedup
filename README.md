@@ -38,6 +38,14 @@ primitive. Vertex data, triangles, materials and texture bytes are copied unchan
 rendered from 50 random navigable poses. The habitat-sim 0.1.7 numbers were measured on an AMD EPYC 9354 with an
 RTX 4090, the 0.3.0 numbers on an Intel i9-14900K with an RTX 4090. Per-scene numbers are in [`results/`](results).
 
+**HM3D v0.2** (800 train scenes, habitat-sim 0.3.0, i9-14900K + RTX 4090): primitives 137,892 → 40,279 (39,707 if the
+50 interleaved scenes below are also fully merged). With all scenes fully merged, an RGB + depth view takes 0.322 →
+0.266 ms on average over scenes (−17.5%, about the same as v0.1); `--adjacent` on those 50 scenes changes this by about
+0.04 percentage points. Geometry is identical in all 800 scenes, and so are all 12,000 rebuilt navmeshes (800 scenes ×
+15 agent sizes). All 800 scenes render pixel-identical (50 poses per scene; 300 for the 50 scenes with interleaved
+materials, which need `--adjacent`, see below). v0.2 changes 187 scenes relative to v0.1, exactly the ones that declare
+the `KHR_materials_unlit` extension; the other 613 originals are identical to v0.1, and so are their merged files.
+
 Weighted by how often each scene appears in training, the per-view render time on MP3D drops by 66% for R2R-CE and 72%
 for RxR-CE (habitat-sim 0.1.7). Most of the gain comes from a few heavy scenes; the median scene improves by 11–21%.
 After merging, the primitive count accounts for only about 10% of the remaining render time, which is mostly
@@ -59,22 +67,26 @@ python merge_glb.py --scenes-dir data/scene_datasets/hm3d/train --pattern '*/*.b
 
 # put the originals back
 python merge_glb.py --scenes-dir data/scene_datasets/mp3d --restore
+
+# keep the draw order: merge only consecutive primitives that share a material
+python merge_glb.py --adjacent in.glb out.glb
 ```
 
 Running it again is safe: it always rebuilds from `<name>.orig`. `.navmesh`, `.house` and `_semantic.ply` files are
 not touched. Processing all 90 MP3D scenes takes about 10 seconds.
 
-[`results/mp3d_md5.txt`](results/mp3d_md5.txt) and [`results/hm3d_v0.1_md5.txt`](results/hm3d_v0.1_md5.txt) list the
-md5 of every original and merged file, so you can check that your inputs and outputs match ours.
+[`results/mp3d_md5.txt`](results/mp3d_md5.txt), [`results/hm3d_v0.1_md5.txt`](results/hm3d_v0.1_md5.txt) and
+[`results/hm3d_v0.2_md5.txt`](results/hm3d_v0.2_md5.txt) list the md5 of every original and merged file, so you can
+check that your inputs and outputs match ours. The v0.2 list also gives the merge mode of each scene.
 
 ## How close is the output to the original?
 
 **Geometry.** In every scene, each material's triangle list (all vertex attributes, in order) is byte-identical to the
 original. `tools/check_geometry.py` verifies this without a GPU.
 
-**Rendering.** Habitat draws primitives in file order. In 80 of the 90 MP3D scenes and in all HM3D scenes, the original
-file already lists its primitives grouped by material. The merged file then contains the same triangles in the same
-order, and the images are identical by construction.
+**Rendering.** Habitat draws primitives in file order. In 80 of the 90 MP3D scenes, in all HM3D v0.1 scenes and in 750
+of the 800 HM3D v0.2 train scenes, the original file already lists its primitives grouped by material. The merged file
+then contains the same triangles in the same order, and the images are identical by construction.
 
 In the other 10 MP3D scenes (`aayBHfsNo7d b8cTxDM8gDG D7G3Y4RVNrH fzynW3qQPVF jtcxE69GiFV kEZ7cmS4wCh V2XKFyX4ASd
 VVfe2KiqLaN XcA2TqTSSAj yqstnuAEVhm`), materials are interleaved. Merging changes which of two coplanar, overlapping
@@ -89,6 +101,13 @@ grows from 680.42 to 680.53 m², while the geodesic distances and the navigabili
 scene stay the same.
 
 None of the 10 interleaved scenes appear in the val_unseen splits of R2R-CE or RxR-CE.
+
+**HM3D v0.2 and `--adjacent`.** In HM3D v0.2, 50 of the 800 train scenes interleave materials; all of them were
+re-exported with Blender. With full merging, a few RGB pixels differ in some of them (300 poses × 6 cameras per scene:
+11 pixels in total, in 6 scenes; depth identical). `--adjacent` merges only runs of consecutive primitives that share a
+material, so the draw order stays the same and these scenes render pixel-identical too. It merges a little less (these
+50 scenes go from 9,244 primitives to 3,259, instead of 2,687) and is almost as fast (−13.3% instead of −13.9% per view
+on them). Their rebuilt navmeshes are identical either way.
 
 ## Checking it yourself
 
@@ -109,8 +128,10 @@ All three take `original.glb merged.glb` instead of `--scenes-dir` to check a si
 ## Supported input
 
 The script accepts glTF binary files in which all mesh nodes share one transform and all primitives are indexed
-triangles with the same attributes and a material. Files with extensions, skins, animations, morph targets or external
-images are rejected with an error. MP3D `.glb` and HM3D `.basis.glb` files meet these conditions.
+triangles with the same attributes and a material. Files with skins, animations, morph targets or external images are
+rejected with an error, and so are glTF extensions other than `KHR_materials_unlit` on materials and
+`GOOGLE_texture_basis` on textures (both are copied unchanged). MP3D `.glb` and HM3D v0.1 / v0.2 `.basis.glb` files meet
+these conditions.
 
 The output uses 32-bit indices, so files grow by about 2% (MP3D) to 6% (HM3D).
 
